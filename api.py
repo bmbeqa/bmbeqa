@@ -1,21 +1,23 @@
 """
-jobs.ge API სერვერი
-FastAPI + SQLite
+jobs.ge API სერვერი - CORS fixed
 """
 
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import sqlite3
 from typing import Optional
-import os
+import threading
 from scraper import run_scrape, DB_PATH, init_db
 
 app = FastAPI(title="jobs.ge API", version="1.0")
 
+# CORS — ყველა origin-ს ნებადართული
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["GET"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -29,28 +31,35 @@ def get_db():
 @app.on_event("startup")
 def on_startup():
     init_db()
-    # პირველი გაშვებისას თუ ბაზა ცარიელია — გავპარსოთ
     con = get_db()
     count = con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
     con.close()
     if count == 0:
-        import threading
         threading.Thread(target=run_scrape, daemon=True).start()
+
+
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "jobs.ge API"}
+
+
+@app.get("/api/health")
+def health():
+    return {"status": "ok"}
 
 
 @app.get("/api/jobs")
 def get_jobs(
-    q: Optional[str] = Query(None, description="საძიებო სიტყვა"),
+    q: Optional[str] = Query(None),
     category: Optional[str] = Query(None),
     location: Optional[str] = Query(None),
     salary: Optional[bool] = Query(None),
     vip: Optional[bool] = Query(None),
-    sort: Optional[str] = Query("new", enum=["new", "deadline", "salary", "vip"]),
+    sort: Optional[str] = Query("new"),
     page: int = Query(1, ge=1),
     per_page: int = Query(50, ge=1, le=500),
 ):
     con = get_db()
-
     where = ["1=1"]
     params = []
 
@@ -77,26 +86,24 @@ def get_jobs(
         "vip": "vip DESC, id DESC",
     }.get(sort, "id DESC")
 
-    sql_count = f"SELECT COUNT(*) FROM jobs WHERE {' AND '.join(where)}"
-    total = con.execute(sql_count, params).fetchone()[0]
+    total = con.execute(
+        f"SELECT COUNT(*) FROM jobs WHERE {' AND '.join(where)}", params
+    ).fetchone()[0]
 
     offset = (page - 1) * per_page
-    sql = f"""
-        SELECT * FROM jobs
-        WHERE {' AND '.join(where)}
-        ORDER BY {order}
-        LIMIT ? OFFSET ?
-    """
-    rows = con.execute(sql, params + [per_page, offset]).fetchall()
+    rows = con.execute(
+        f"SELECT * FROM jobs WHERE {' AND '.join(where)} ORDER BY {order} LIMIT ? OFFSET ?",
+        params + [per_page, offset]
+    ).fetchall()
     con.close()
 
-    return {
+    return JSONResponse({
         "total": total,
         "page": page,
         "per_page": per_page,
-        "pages": (total + per_page - 1) // per_page,
+        "pages": max(1, (total + per_page - 1) // per_page),
         "jobs": [dict(r) for r in rows],
-    }
+    })
 
 
 @app.get("/api/stats")
@@ -106,40 +113,21 @@ def get_stats():
     salary = con.execute("SELECT COUNT(*) FROM jobs WHERE salary=1").fetchone()[0]
     vip = con.execute("SELECT COUNT(*) FROM jobs WHERE vip=1").fetchone()[0]
     is_new = con.execute("SELECT COUNT(*) FROM jobs WHERE is_new=1").fetchone()[0]
-    cats = con.execute("""
-        SELECT category, COUNT(*) as cnt FROM jobs
-        WHERE category != ''
-        GROUP BY category ORDER BY cnt DESC LIMIT 15
-    """).fetchall()
-    locs = con.execute("""
-        SELECT location, COUNT(*) as cnt FROM jobs
-        WHERE location != ''
-        GROUP BY location ORDER BY cnt DESC LIMIT 10
-    """).fetchall()
-    last_scrape = con.execute(
+    last = con.execute(
         "SELECT ended_at, total FROM scrape_log ORDER BY id DESC LIMIT 1"
     ).fetchone()
     con.close()
 
-    return {
+    return JSONResponse({
         "total": total,
         "salary": salary,
         "vip": vip,
         "is_new": is_new,
-        "categories": [dict(r) for r in cats],
-        "locations": [dict(r) for r in locs],
-        "last_scrape": dict(last_scrape) if last_scrape else None,
-    }
+        "last_scrape": dict(last) if last else None,
+    })
 
 
 @app.post("/api/scrape")
 def trigger_scrape():
-    """ხელით გაშვება (ოჯახისთვის ან debug-ისთვის)"""
-    import threading
     threading.Thread(target=run_scrape, daemon=True).start()
     return {"status": "scrape started"}
-
-
-@app.get("/api/health")
-def health():
-    return {"status": "ok"}
