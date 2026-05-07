@@ -1,6 +1,5 @@
 """
-jobs.ge სრული სკრეიფერი
-პარსავს ყველა გვერდს და ინახავს SQLite-ში
+jobs.ge სრული სკრეიფერი - ყველა ვაკანსია
 """
 
 import requests
@@ -22,7 +21,7 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 DB_PATH = "jobs.db"
-DELAY = 1.5  # წამი გვერდებს შორის
+DELAY = 1.0
 
 
 def init_db():
@@ -67,102 +66,153 @@ def fetch_page(url: str, retries: int = 3) -> Optional[BeautifulSoup]:
             return BeautifulSoup(r.text, "html.parser")
         except Exception as e:
             log.warning(f"Attempt {attempt+1} failed for {url}: {e}")
-            time.sleep(2 * (attempt + 1))
+            time.sleep(3 * (attempt + 1))
     return None
 
 
 def get_total_pages(soup: BeautifulSoup) -> int:
-    """ბოლო გვერდის ნომრის ამოღება pagination-იდან"""
+    """ბოლო გვერდის ნომრის ამოღება — რამდენიმე სტრატეგია"""
     try:
-        pages = soup.select("div.pagination a, div#pagination a, a[href*='page=']")
+        # სტრატეგია 1: pagination ლინკებიდან მაქსიმუმი
         nums = []
-        for a in pages:
+        for a in soup.find_all("a", href=True):
             href = a.get("href", "")
-            m = re.search(r"page=(\d+)", href)
+            m = re.search(r"[?&]page=(\d+)", href)
             if m:
                 nums.append(int(m.group(1)))
-            txt = a.get_text(strip=True)
-            if txt.isdigit():
-                nums.append(int(txt))
-        return max(nums) if nums else 1
+
+        if nums:
+            total = max(nums)
+            log.info(f"Total pages from pagination links: {total}")
+            return total
+
+        # სტრატეგია 2: "გვერდი X / Y" ტექსტი
+        for el in soup.find_all(string=re.compile(r"\d+\s*/\s*\d+")):
+            m = re.search(r"(\d+)\s*/\s*(\d+)", el)
+            if m:
+                return int(m.group(2))
+
+        # სტრატეგია 3: jobs რაოდენობიდან გამოთვლა
+        total_text = soup.find(string=re.compile(r"სულ.*?(\d+)"))
+        if total_text:
+            m = re.search(r"(\d+)", total_text)
+            if m:
+                total_jobs = int(m.group(1))
+                return max(1, (total_jobs + 19) // 20)
+
     except Exception as e:
         log.warning(f"Could not get total pages: {e}")
-        return 1
+
+    return 1
 
 
-def parse_job_row(row) -> Optional[dict]:
-    """ერთი ვაკანსიის row-ის დამუშავება"""
-    try:
-        job = {}
-
-        # ID
-        link = row.select_one("a[href*='view=jobs']")
-        if not link:
-            return None
-        href = link.get("href", "")
-        m = re.search(r"id=(\d+)", href)
-        job["id"] = int(m.group(1)) if m else None
-        if not job["id"]:
-            return None
-
-        # სათაური
-        job["title"] = link.get_text(strip=True)
-        job["url"] = BASE_URL + "/ge/?" + href.lstrip("?./") if href.startswith("?") else href
-
-        # კომპანია
-        company_el = row.select_one("td.company, .joblist-company-name, a[href*='company']")
-        job["company"] = company_el.get_text(strip=True) if company_el else ""
-
-        # კატეგორია
-        cat_el = row.select_one("td.category, .joblist-category")
-        job["category"] = cat_el.get_text(strip=True) if cat_el else ""
-
-        # ლოკაცია
-        loc_el = row.select_one("td.location, .joblist-location")
-        job["location"] = loc_el.get_text(strip=True) if loc_el else ""
-
-        # ხელფასი (badge-ს მიხედვით)
-        job["salary"] = 1 if row.select_one(".salary-badge, img[src*='salary'], .has-salary") else 0
-
-        # VIP
-        job["vip"] = 1 if row.select_one(".vip-badge, img[src*='vip'], .is-vip, td.vip") else 0
-
-        # თარიღები
-        dates = row.select("td.date, .joblist-date, td[class*='date']")
-        job["posted"] = dates[0].get_text(strip=True) if len(dates) > 0 else ""
-        job["deadline"] = dates[1].get_text(strip=True) if len(dates) > 1 else ""
-
-        # ახალია თუ არა (დღეს გამოქვეყნდა)
-        today = datetime.now().strftime("%d %B").lstrip("0")
-        job["is_new"] = 1 if today in job.get("posted", "") else 0
-        job["scraped_at"] = datetime.now().isoformat()
-
-        return job
-    except Exception as e:
-        log.debug(f"Row parse error: {e}")
-        return None
-
-
-def scrape_page(page_num: int) -> list[dict]:
-    """ერთი გვერდის გაპარსვა"""
-    url = f"{BASE_URL}/ge/?page={page_num}"
-    soup = fetch_page(url)
-    if not soup:
-        return []
-
-    rows = soup.select("table.jobs-list tr, tr.job-row, div.job-item, .joblist tr[id]")
-
-    # fallback — ნებისმიერი tr რომელსაც view=jobs ბმული აქვს
-    if not rows:
-        rows = [tr for tr in soup.select("tr") if tr.select_one("a[href*='view=jobs']")]
-
+def parse_jobs_from_soup(soup: BeautifulSoup) -> list[dict]:
+    """soup-იდან ყველა ვაკანსიის ამოღება"""
     jobs = []
-    for row in rows:
-        job = parse_job_row(row)
-        if job:
-            jobs.append(job)
 
-    log.info(f"Page {page_num}: {len(jobs)} jobs")
+    # ყველა row რომელსაც view=jobs ბმული აქვს
+    rows = [tr for tr in soup.find_all("tr") if tr.find("a", href=re.compile(r"view=jobs"))]
+
+    for row in rows:
+        try:
+            link = row.find("a", href=re.compile(r"view=jobs"))
+            if not link:
+                continue
+
+            href = link.get("href", "")
+            m = re.search(r"id=(\d+)", href)
+            if not m:
+                continue
+
+            job_id = int(m.group(1))
+            title = link.get_text(strip=True)
+            if not title:
+                continue
+
+            # URL
+            if href.startswith("http"):
+                url = href
+            elif href.startswith("?"):
+                url = f"{BASE_URL}/ge/{href}"
+            else:
+                url = f"{BASE_URL}{href}"
+
+            # ყველა td
+            tds = row.find_all("td")
+            td_texts = [td.get_text(strip=True) for td in tds]
+
+            # კომპანია — მეორე ბმული ან td
+            company = ""
+            links = row.find_all("a", href=True)
+            for lnk in links:
+                if "company" in lnk.get("href", "") or "employer" in lnk.get("href", ""):
+                    company = lnk.get_text(strip=True)
+                    break
+            if not company and len(td_texts) > 1:
+                company = td_texts[1] if td_texts[1] != title else ""
+
+            # კატეგორია
+            category = ""
+            for lnk in links:
+                if "cid=" in lnk.get("href", "") or "category" in lnk.get("href", ""):
+                    category = lnk.get_text(strip=True)
+                    break
+
+            # ლოკაცია
+            location = ""
+            for lnk in links:
+                if "lid=" in lnk.get("href", "") or "location" in lnk.get("href", ""):
+                    location = lnk.get_text(strip=True)
+                    break
+
+            # თარიღები — ბოლო ორი td-დან
+            posted = ""
+            deadline = ""
+            date_pattern = re.compile(r"\d{1,2}[\s\-/]\w+|\d{2}\.\d{2}\.\d{4}|\d{4}-\d{2}-\d{2}")
+            date_tds = [t for t in td_texts if date_pattern.search(t)]
+            if len(date_tds) >= 2:
+                posted = date_tds[0]
+                deadline = date_tds[1]
+            elif len(date_tds) == 1:
+                deadline = date_tds[0]
+
+            # VIP
+            vip = 1 if row.find(class_=re.compile(r"vip", re.I)) or \
+                       row.find("img", src=re.compile(r"vip", re.I)) or \
+                       "vip" in row.get("class", []) else 0
+
+            # ხელფასი
+            salary = 1 if row.find(class_=re.compile(r"salary|wage", re.I)) or \
+                          row.find("img", src=re.compile(r"salary|lari", re.I)) else 0
+
+            # is_new — დღეს გამოქვეყნებული
+            today = datetime.now()
+            today_strs = [
+                today.strftime("%d.%m.%Y"),
+                today.strftime("%-d %B"),
+                today.strftime("%d %B"),
+            ]
+            is_new = 1 if any(s in posted for s in today_strs) else 0
+
+            jobs.append({
+                "id": job_id,
+                "title": title,
+                "company": company,
+                "category": category,
+                "location": location,
+                "salary": salary,
+                "vip": vip,
+                "posted": posted,
+                "deadline": deadline,
+                "url": url,
+                "is_new": is_new,
+                "scraped_at": datetime.now().isoformat(),
+            })
+
+        except Exception as e:
+            log.debug(f"Row parse error: {e}")
+            continue
+
     return jobs
 
 
@@ -170,8 +220,7 @@ def save_jobs(jobs: list[dict]):
     if not jobs:
         return
     con = sqlite3.connect(DB_PATH)
-    cur = con.cursor()
-    cur.executemany("""
+    con.executemany("""
         INSERT OR REPLACE INTO jobs
             (id, title, company, category, location, salary, vip, posted, deadline, url, is_new, scraped_at)
         VALUES
@@ -182,47 +231,53 @@ def save_jobs(jobs: list[dict]):
 
 
 def run_scrape():
-    """სრული გაპარსვა — ყველა გვერდი"""
+    """სრული გაპარსვა — ყველა გვერდი, ყველა ვაკანსია"""
     started = datetime.now().isoformat()
     log.info("=== Scrape started ===")
     init_db()
 
-    # პირველი გვერდი — ვიგებთ სულ რამდენი გვერდია
-    url_first = f"{BASE_URL}/ge/"
-    soup_first = fetch_page(url_first)
-    if not soup_first:
+    # გვერდი 1
+    soup1 = fetch_page(f"{BASE_URL}/ge/")
+    if not soup1:
         log.error("Cannot reach jobs.ge")
-        return
+        return 0
 
-    total_pages = get_total_pages(soup_first)
-    log.info(f"Total pages: {total_pages}")
+    total_pages = get_total_pages(soup1)
+    log.info(f"Total pages detected: {total_pages}")
 
-    # პირველი გვერდი დამუშავება
-    rows = [tr for tr in soup_first.select("tr") if tr.select_one("a[href*='view=jobs']")]
-    all_jobs = []
-    for row in rows:
-        job = parse_job_row(row)
-        if job:
-            all_jobs.append(job)
+    all_jobs = parse_jobs_from_soup(soup1)
     log.info(f"Page 1: {len(all_jobs)} jobs")
+    save_jobs(all_jobs)
+
+    total_saved = len(all_jobs)
 
     # დანარჩენი გვერდები
     for p in range(2, total_pages + 1):
         time.sleep(DELAY)
-        jobs = scrape_page(p)
-        all_jobs.extend(jobs)
-
-    save_jobs(all_jobs)
+        url = f"{BASE_URL}/ge/?page={p}"
+        soup = fetch_page(url)
+        if not soup:
+            log.warning(f"Skipping page {p}")
+            continue
+        jobs = parse_jobs_from_soup(soup)
+        if not jobs:
+            log.info(f"Page {p}: empty — stopping")
+            break
+        log.info(f"Page {p}: {len(jobs)} jobs")
+        save_jobs(jobs)
+        total_saved += len(jobs)
 
     ended = datetime.now().isoformat()
     con = sqlite3.connect(DB_PATH)
-    con.execute("INSERT INTO scrape_log (started_at, ended_at, total, status) VALUES (?,?,?,?)",
-                (started, ended, len(all_jobs), "ok"))
+    con.execute(
+        "INSERT INTO scrape_log (started_at, ended_at, total, status) VALUES (?,?,?,?)",
+        (started, ended, total_saved, "ok")
+    )
     con.commit()
     con.close()
 
-    log.info(f"=== Done: {len(all_jobs)} jobs saved ===")
-    return len(all_jobs)
+    log.info(f"=== Done: {total_saved} total jobs ===")
+    return total_saved
 
 
 if __name__ == "__main__":
